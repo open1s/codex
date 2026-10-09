@@ -38,6 +38,7 @@ use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::NVIDIA_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
@@ -64,12 +65,13 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 6] = [
     AMAZON_BEDROCK_PROVIDER_ID,
     AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
     OPENAI_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
+    NVIDIA_PROVIDER_ID,
 ];
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
@@ -906,7 +908,9 @@ pub fn validate_reserved_model_provider_ids(
         .filter(|key| {
             !matches!(
                 key.as_str(),
-                AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                AMAZON_BEDROCK_PROVIDER_ID
+                    | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                    | NVIDIA_PROVIDER_ID
             ) && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
         })
         .map(|key| format!("`{key}`"))
@@ -934,7 +938,11 @@ pub fn validate_model_providers(
         ) {
             provider
                 .validate_bedrock_override()
-                .map_err(|message| format!("model_providers.{key} {message}"))?;
+                .map_err(|message| format!("model_providers.{key}: {message}"))?;
+        } else if key.as_str() == NVIDIA_PROVIDER_ID {
+            provider
+                .validate_nvidia_override()
+                .map_err(|message| format!("model_providers.{key}: {message}"))?;
         } else {
             if provider.aws.is_some() {
                 return Err(format!(
@@ -989,6 +997,7 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_model_provider_info::WireApi;
     use pretty_assertions::assert_eq;
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -1094,5 +1103,90 @@ command = "   "
                 "model_providers.amazon-bedrock: provider auth.command must not be empty"
             )
         );
+    }
+
+    #[test]
+    fn nvidia_provider_base_url_override_is_accepted() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[model_providers.nvidia]
+base_url = "http://127.0.0.1:11436/v1"
+"#,
+        )
+        .expect("built-in nvidia provider endpoint override should be accepted");
+
+        let nvidia = config
+            .model_providers
+            .get(NVIDIA_PROVIDER_ID)
+            .expect("nvidia");
+        assert_eq!(
+            nvidia.base_url.as_deref(),
+            Some("http://127.0.0.1:11436/v1")
+        );
+        assert_eq!(nvidia.name, "");
+    }
+
+    #[test]
+    fn nvidia_provider_override_rejects_unsupported_fields() {
+        let err = toml::from_str::<ConfigToml>(
+            r#"
+[model_providers.nvidia]
+name = "Custom NIM"
+"#,
+        )
+        .expect_err("built-in nvidia provider must not be redefined");
+
+        let message = err.to_string();
+        assert!(message.contains("model_providers.nvidia:"));
+        assert!(message.contains("only supports changing"));
+    }
+
+    #[test]
+    fn nvidia_provider_wire_api_chat_override_is_accepted() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[model_providers.nvidia]
+base_url = "http://127.0.0.1:11436/v1"
+wire_api = "chat"
+"#,
+        )
+        .expect("built-in nvidia provider wire_api override should be accepted");
+
+        let nvidia = config
+            .model_providers
+            .get(NVIDIA_PROVIDER_ID)
+            .expect("nvidia");
+        assert_eq!(nvidia.wire_api, WireApi::Chat);
+    }
+
+    #[test]
+    fn custom_provider_accepts_chat_wire_api() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[model_providers.local]
+name = "Local"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "chat"
+"#,
+        )
+        .expect("chat wire_api should be accepted for custom providers");
+
+        let provider = config.model_providers.get("local").expect("local");
+        assert_eq!(provider.wire_api, WireApi::Chat);
+    }
+
+    #[test]
+    fn openai_provider_id_is_reserved() {
+        let err = toml::from_str::<ConfigToml>(
+            r#"
+[model_providers.openai]
+name = "Custom OpenAI"
+"#,
+        )
+        .expect_err("built-in openai provider must not be overridable");
+
+        let message = err.to_string();
+        assert!(message.contains("reserved built-in provider IDs"));
+        assert!(message.contains("`openai`"));
     }
 }

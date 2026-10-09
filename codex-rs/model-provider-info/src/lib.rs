@@ -94,7 +94,10 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+const NVIDIA_PROVIDER_NAME: &str = "NVIDIA NIM";
+pub const NVIDIA_PROVIDER_ID: &str = "nvidia";
+pub const NVIDIA_NIM_DEFAULT_BASE_URL: &str = "https://integrate.api.nim.nvidia.com/v1";
+pub const NVIDIA_API_KEY_ENV_VAR: &str = "NVIDIA_API_KEY";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -105,12 +108,16 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// The Chat Completions API exposed by OpenAI-compatible providers at
+    /// `/v1/chat/completions`.
+    Chat,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::Chat => "chat",
         };
         f.write_str(value)
     }
@@ -124,8 +131,11 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
-            "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            "chat" => Ok(Self::Chat),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "chat"],
+            )),
         }
     }
 }
@@ -290,7 +300,33 @@ other non-default provider fields are not supported"
         Ok(())
     }
 
+    /// Checks that a configured NVIDIA entry only customizes supported fields.
+    /// Call this on the override before merging it with the built-in provider.
+    pub fn validate_nvidia_override(&self) -> Result<(), String> {
+        let unsupported_fields = Self {
+            base_url: None,
+            env_key: None,
+            env_key_instructions: None,
+            http_headers: None,
+            query_params: None,
+            wire_api: WireApi::Responses,
+            ..self.clone()
+        };
+        if unsupported_fields != Self::default() {
+            return Err("only supports changing \
+`base_url`, `env_key`, `env_key_instructions`, `http_headers`, `query_params`, and `wire_api`; \
+other non-default provider fields are not supported"
+                .to_string());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.wire_api == WireApi::Chat && self.supports_websockets {
+            return Err(
+                "provider supports_websockets requires wire_api = \"responses\"".to_string(),
+            );
+        }
         if let Some(gateway) = &self.gateway_oauth {
             gateway.validate(self)?;
         }
@@ -605,6 +641,37 @@ other non-default provider fields are not supported"
         provider
     }
 
+    /// NVIDIA NIM's hosted, OpenAI-compatible endpoint.
+    pub fn create_nvidia_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: NVIDIA_PROVIDER_NAME.into(),
+            base_url: Some(NVIDIA_NIM_DEFAULT_BASE_URL.into()),
+            model_catalog_url: None,
+            env_key: Some(NVIDIA_API_KEY_ENV_VAR.into()),
+            env_key_instructions: Some(
+                "Create an API key at https://build.nvidia.com and export it as \
+`NVIDIA_API_KEY`."
+                    .into(),
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            gateway_oauth: None,
+            aws: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+            include_internal_metadata: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -658,10 +725,10 @@ pub fn built_in_model_providers(
     let amazon_bedrock_runtime_provider =
         P::create_amazon_bedrock_runtime_provider(/*aws*/ None);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // We bundle OpenAI, Amazon Bedrock, NVIDIA NIM, and the open source ("oss")
+    // providers by default. We do not want to be in the business of adjucating
+    // other third-party providers, so users are encouraged to add to
+    // `model_providers` in config.toml to add their own.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
@@ -669,6 +736,7 @@ pub fn built_in_model_providers(
             AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
             amazon_bedrock_runtime_provider,
         ),
+        (NVIDIA_PROVIDER_ID, P::create_nvidia_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -686,8 +754,8 @@ pub fn built_in_model_providers(
 /// Merge configured providers into the built-in provider catalog.
 ///
 /// Configured providers extend the built-in set. Built-in providers are not
-/// generally overridable, but built-in Amazon Bedrock providers allow the user
-/// to customize their endpoint, authentication, headers, and AWS settings.
+/// generally overridable, but the built-in Amazon Bedrock and NVIDIA providers
+/// allow the user to customize their endpoint and authentication.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
@@ -716,6 +784,37 @@ pub fn merge_configured_model_providers(
                         .get_or_insert_default()
                         .extend(http_headers_override);
                 }
+            }
+        } else if key.as_str() == NVIDIA_PROVIDER_ID {
+            provider
+                .validate_nvidia_override()
+                .map_err(|message| format!("model_providers.{key} {message}"))?;
+            let base_url_override = provider.base_url.take();
+            let env_key_override = provider.env_key.take();
+            let env_key_instructions_override = provider.env_key_instructions.take();
+            let http_headers_override = provider.http_headers.take();
+            let query_params_override = provider.query_params.take();
+            let wire_api_override = provider.wire_api;
+            if let Some(built_in_provider) = model_providers.get_mut(&key) {
+                if let Some(base_url_override) = base_url_override {
+                    built_in_provider.base_url = Some(base_url_override);
+                }
+                if let Some(env_key_override) = env_key_override {
+                    built_in_provider.env_key = Some(env_key_override);
+                }
+                if let Some(env_key_instructions_override) = env_key_instructions_override {
+                    built_in_provider.env_key_instructions = Some(env_key_instructions_override);
+                }
+                if let Some(http_headers_override) = http_headers_override {
+                    built_in_provider
+                        .http_headers
+                        .get_or_insert_default()
+                        .extend(http_headers_override);
+                }
+                if let Some(query_params_override) = query_params_override {
+                    built_in_provider.query_params = Some(query_params_override);
+                }
+                built_in_provider.wire_api = wire_api_override;
             }
         } else {
             model_providers.entry(key).or_insert(provider);

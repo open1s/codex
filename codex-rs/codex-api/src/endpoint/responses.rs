@@ -5,9 +5,11 @@ use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::requests::Compression;
+use crate::requests::chat::translate_responses_request_to_chat;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
+use crate::sse::spawn_chat_stream;
 use crate::sse::spawn_response_stream;
 use crate::telemetry::SseTelemetry;
 use codex_client::EncodedJsonBody;
@@ -94,6 +96,74 @@ impl<T: HttpTransport> ResponsesClient<T> {
 
         self.stream_encoded(body, headers, compression, turn_state)
             .await
+    }
+
+    /// Streams a turn over the Chat Completions API, translating the
+    /// Responses-shaped request into a chat body and its SSE stream back into
+    /// Responses-shaped events.
+    #[instrument(
+        name = "chat.stream_request",
+        level = "info",
+        skip_all,
+        fields(
+            transport = "chat_http",
+            http.method = "POST",
+            api.path = "/chat/completions"
+        )
+    )]
+    pub async fn stream_chat_request(
+        &self,
+        request: ResponsesApiRequest,
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
+        let ResponsesOptions {
+            session_id,
+            thread_id,
+            session_source,
+            extra_headers,
+            compression,
+            turn_state: _,
+        } = options;
+        let (body, catalog) = translate_responses_request_to_chat(&request)?;
+        let body = EncodedJsonBody::encode(&body)
+            .map_err(|e| ApiError::Stream(format!("failed to encode chat request: {e}")))?;
+
+        let mut headers = extra_headers;
+        if let Some(ref thread_id) = thread_id {
+            insert_header(&mut headers, "x-client-request-id", thread_id);
+        }
+        headers.extend(build_session_headers(session_id, thread_id));
+        if let Some(subagent) = subagent_header(&session_source) {
+            insert_header(&mut headers, "x-openai-subagent", &subagent);
+        }
+
+        let request_compression = match compression {
+            Compression::None => RequestCompression::None,
+            Compression::Zstd => RequestCompression::Zstd,
+        };
+        let stream_response = self
+            .session
+            .stream_encoded_json_with(
+                Method::POST,
+                "/chat/completions",
+                headers,
+                Some(body),
+                |req| {
+                    req.headers.insert(
+                        http::header::ACCEPT,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    req.compression = request_compression;
+                },
+            )
+            .await?;
+
+        Ok(spawn_chat_stream(
+            stream_response,
+            catalog,
+            self.session.provider().stream_idle_timeout,
+            self.sse_telemetry.clone(),
+        ))
     }
 
     #[instrument(

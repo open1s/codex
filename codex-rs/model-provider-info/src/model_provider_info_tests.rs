@@ -184,7 +184,7 @@ supports_standalone_web_search = true
 }
 
 #[test]
-fn test_deserialize_chat_wire_api_shows_helpful_error() {
+fn test_deserialize_chat_wire_api() {
     let provider_toml = r#"
 name = "OpenAI using Chat Completions"
 base_url = "https://api.openai.com/v1"
@@ -192,8 +192,38 @@ env_key = "OPENAI_API_KEY"
 wire_api = "chat"
         "#;
 
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(provider.wire_api, WireApi::Chat);
+}
+
+#[test]
+fn test_deserialize_unknown_wire_api_lists_variants() {
+    let provider_toml = r#"
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+wire_api = "bogus"
+        "#;
+
     let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    assert!(err.to_string().contains("unknown variant"));
+    assert!(err.to_string().contains("responses"));
+    assert!(err.to_string().contains("chat"));
+}
+
+#[test]
+fn test_validate_rejects_chat_with_websockets() {
+    let provider_toml = r#"
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+wire_api = "chat"
+supports_websockets = true
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(
+        provider.validate().unwrap_err(),
+        "provider supports_websockets requires wire_api = \"responses\""
+    );
 }
 
 #[test]
@@ -488,6 +518,42 @@ fn test_built_in_model_providers_include_amazon_bedrock_runtime() {
 }
 
 #[test]
+fn test_built_in_model_providers_include_nvidia_nim() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+
+    assert_eq!(
+        providers.get(NVIDIA_PROVIDER_ID),
+        Some(&ModelProviderInfo {
+            name: "NVIDIA NIM".to_string(),
+            base_url: Some(NVIDIA_NIM_DEFAULT_BASE_URL.to_string()),
+            model_catalog_url: None,
+            env_key: Some(NVIDIA_API_KEY_ENV_VAR.to_string()),
+            env_key_instructions: Some(
+                "Create an API key at https://build.nvidia.com and export it as \
+`NVIDIA_API_KEY`."
+                    .to_string()
+            ),
+            experimental_bearer_token: None,
+            auth: None,
+            gateway_oauth: None,
+            aws: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+            include_internal_metadata: false,
+        })
+    );
+}
+
+#[test]
 fn test_merge_configured_model_providers_adds_custom_provider() {
     let custom_provider = ModelProviderInfo {
         name: "Custom".to_string(),
@@ -552,6 +618,79 @@ fn test_merge_configured_model_providers_applies_amazon_bedrock_aws_override() {
         ),
         Ok(expected)
     );
+}
+
+#[test]
+fn test_merge_configured_model_providers_applies_nvidia_endpoint_override() {
+    let configured_model_providers = std::collections::HashMap::from([(
+        NVIDIA_PROVIDER_ID.to_string(),
+        ModelProviderInfo {
+            base_url: Some("http://127.0.0.1:11436/v1".to_string()),
+            env_key: Some("LOCAL_NIM_KEY".to_string()),
+            ..ModelProviderInfo::default()
+        },
+    )]);
+
+    let mut expected = built_in_model_providers(/*openai_base_url*/ None);
+    let nvidia = expected
+        .get_mut(NVIDIA_PROVIDER_ID)
+        .expect("NVIDIA provider should be built in");
+    nvidia.base_url = Some("http://127.0.0.1:11436/v1".to_string());
+    nvidia.env_key = Some("LOCAL_NIM_KEY".to_string());
+
+    assert_eq!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            configured_model_providers,
+        ),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn test_merge_configured_model_providers_applies_nvidia_wire_api_override() {
+    let configured_model_providers = std::collections::HashMap::from([(
+        NVIDIA_PROVIDER_ID.to_string(),
+        ModelProviderInfo {
+            base_url: Some("http://127.0.0.1:11436/v1".to_string()),
+            wire_api: WireApi::Chat,
+            ..ModelProviderInfo::default()
+        },
+    )]);
+
+    let mut expected = built_in_model_providers(/*openai_base_url*/ None);
+    let nvidia = expected
+        .get_mut(NVIDIA_PROVIDER_ID)
+        .expect("NVIDIA provider should be built in");
+    nvidia.base_url = Some("http://127.0.0.1:11436/v1".to_string());
+    nvidia.wire_api = WireApi::Chat;
+
+    assert_eq!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            configured_model_providers,
+        ),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn test_merge_configured_model_providers_rejects_nvidia_redefinition() {
+    let configured_model_providers = std::collections::HashMap::from([(
+        NVIDIA_PROVIDER_ID.to_string(),
+        ModelProviderInfo {
+            name: "Custom NIM".to_string(),
+            ..ModelProviderInfo::default()
+        },
+    )]);
+
+    let error = merge_configured_model_providers(
+        built_in_model_providers(/*openai_base_url*/ None),
+        configured_model_providers,
+    )
+    .expect_err("nvidia provider identity must stay built in");
+
+    assert!(error.starts_with("model_providers.nvidia only supports changing"));
 }
 
 #[test]

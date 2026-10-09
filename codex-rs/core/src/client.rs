@@ -1678,10 +1678,14 @@ impl ModelClientSession {
             let responses_headers = self
                 .client
                 .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
-            tracing::Span::current().record("api.path", "/responses");
+            let api_path = match self.client.state.provider.info().wire_api {
+                WireApi::Chat => "/chat/completions",
+                WireApi::Responses => "/responses",
+            };
+            tracing::Span::current().record("api.path", api_path);
             let transport = self.client.build_api_transport(
                 &client_setup.api_provider,
-                "/responses",
+                api_path,
                 client_setup.redirect_policy,
             )?;
             let request_auth_context = AuthRequestTelemetryContext::new(
@@ -1693,7 +1697,7 @@ impl ModelClientSession {
             let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
                 session_telemetry,
                 request_auth_context,
-                RequestRouteTelemetry::for_endpoint("/responses"),
+                RequestRouteTelemetry::for_endpoint(api_path),
                 self.client.state.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
@@ -1768,7 +1772,10 @@ impl ModelClientSession {
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-            let stream_result = client.stream_request(request, options).await;
+            let stream_result = match self.client.state.provider.info().wire_api {
+                WireApi::Chat => client.stream_chat_request(request, options).await,
+                WireApi::Responses => client.stream_request(request, options).await,
+            };
 
             match stream_result {
                 Ok(stream) => {
@@ -2236,6 +2243,21 @@ impl ModelClientSession {
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
+            // Chat Completions shares the Responses-shaped pipeline; the
+            // request and SSE stream are translated at the wire boundary.
+            WireApi::Chat => {
+                self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
