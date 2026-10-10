@@ -552,6 +552,7 @@ fn test_built_in_model_providers_include_nvidia_nim() {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            capabilities: None,
             include_internal_metadata: false,
         })
     );
